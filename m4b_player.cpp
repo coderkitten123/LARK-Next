@@ -15,6 +15,7 @@
 #include "music_backend.h"
 #include "database_manager.h"
 #include "keyboarddialog.hpp"
+#include "abs_ui.h"
 #include "openlipc/openlipc.h"
 
 #include "icons.h"
@@ -131,6 +132,7 @@ std::string get_db_path() {
 }
 
 void save_history() {
+    if (abs_is_active()) return;   // ABS progress is synced to the server, not the local DB
     if (!current_file.empty()) {
         gint64 pos = backend.get_position() / GST_SECOND;
         gint64 dur = backend.get_duration() / GST_SECOND;
@@ -250,6 +252,7 @@ void on_backend_error(const char* msg, void* data) {
 
 gboolean update_ui(gpointer data) {
     (void)data;
+    abs_sync_tick();   // ABS: throttled server progress sync (no-op when inactive)
     if (!backend.is_playing && !backend.is_paused) return TRUE;
 
     gint64 pos = backend.get_position();
@@ -274,18 +277,23 @@ void on_play_pause_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;(void)data;
     if (backend.is_playing) {
         backend.pause();
+    } else if (backend.is_paused) {
+        backend.pause();
+    } else if (abs_is_active()) {
+        // ABS book was stopped (e.g. EOS of last track, or error): replay current position
+        abs_replay_current();
     } else {
         if (!current_file.empty()) {
-            if (backend.is_paused) {
-                backend.pause();
-            } else {
-                backend.play_file(current_file.c_str(), last_timestamp);
-            }
+            backend.play_file(current_file.c_str(), last_timestamp);
         }
     }
 }
 
 void jump_relative(int seconds) {
+    if (abs_is_active()) {
+        abs_jump_relative(seconds);
+        return;
+    }
     if (current_file.empty()) return;
     
     gint64 duration = backend.get_duration() / GST_SECOND;
@@ -333,6 +341,7 @@ void on_ff_clicked(GtkWidget *widget, gpointer data) {
 void on_destroy(GtkWidget *widget, gpointer data) {
     (void)widget;
     (void)data;
+    abs_shutdown();   // ABS: final progress sync + session close
     backend.stop();
     save_history();
     LipcSetIntProperty(lipcInstance,"com.lab126.powerd","flIntensity",flIntensity);
@@ -349,7 +358,9 @@ void on_close_clicked(GtkWidget *widget, gpointer data) {
 
 void on_file_open(const char* filepath) {
     if (!filepath) return;
-    
+
+    if (abs_is_active()) abs_shutdown();   // opening a local file ends any ABS session
+
     if (!current_file.empty() && (backend.is_playing || backend.is_paused)) {
         gint64 pos = backend.get_position() / GST_SECOND;
         gint64 dur = backend.get_duration() / GST_SECOND;
@@ -602,6 +613,7 @@ int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
 
     backend.set_error_callback(on_backend_error, NULL);
+    backend.set_eos_callback(abs_on_eos_wrapper, NULL);   // ABS: track chaining
 
     init_database();
     if (argc > 1) {
@@ -751,6 +763,12 @@ int main(int argc, char *argv[]) {
     g_signal_connect(btn_bookmark_list, "clicked", G_CALLBACK(on_bookmark_list_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(bot_hbox), btn_bookmark_list, FALSE, FALSE, 0);
 
+    // Stage 2: Audiobookshelf browser (text button; no dedicated icon yet)
+    GtkWidget *btn_abs = gtk_button_new_with_label("ABS");
+    gtk_widget_set_size_request(btn_abs, btn_size, btn_size);
+    g_signal_connect(btn_abs, "clicked", G_CALLBACK(open_abs_browser), NULL);
+    gtk_box_pack_start(GTK_BOX(bot_hbox), btn_abs, FALSE, FALSE, 0);
+
     GtkWidget *spacer = gtk_label_new("");
     gtk_box_pack_start(GTK_BOX(bot_hbox), spacer, TRUE, TRUE, 0);
 
@@ -783,6 +801,7 @@ int main(int argc, char *argv[]) {
 
 
     g_timeout_add(1000, update_ui, NULL);
+    abs_debug_autostart();   // LARK_ABS_TEST=1: auto-open the ABS browser for testing
 
     gtk_main();
 
