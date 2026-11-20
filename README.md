@@ -1,58 +1,60 @@
 # LARK Next
 
-**LARK Next** is an enhanced continuation of [LARK (Libre Audiobook Reader for Kindle)](https://github.com/kbarni/LARKPlayer), a free audiobook player for jailbroken Kindle devices.
-
-It builds on the original project with an improved interface, Audiobookshelf integration, and additional playback and usability improvements.
-
-> **Compatibility:** The original project currently documents support for Kindle firmware below 5.19. Check compatibility with your device before installing.
+LARK Next is a free audiobook player for jailbroken Kindle devices. It continues the [LARKPlayer project](https://github.com/kbarni/LARKPlayer) with a refreshed interface, Audiobookshelf support, and playback improvements.
 
 ## Features
 
-- MP3 and AAC-encoded M4B audiobook playback
-- Audiobookshelf server integration
-- Audiobook library browsing and book details
-- Playback session and progress integration
-- Listening history, bookmarks and chapter support
-- Improved interface and on-screen keyboard
-- E-ink display refresh handling
-- Audio and cover caching improvements
-- Backlight management
+- Play MP3 and AAC audio in M4B files
+- Browse Audiobookshelf libraries and book details
+- Sync playback sessions and listening progress with Audiobookshelf
+- Use local audiobook files, history, chapters, and bookmarks
+- Configure display refresh, backlight, and sleep behavior
 
-## Installation
+## Compatibility
 
-Download the latest available package from the [LARK Next Releases](https://github.com/coderkitten123/LARK-Next/releases) page.
+The original LARK project documents support for Kindle firmware earlier than 5.19. This repository's supplied cross-compilation toolchain builds a 32-bit ARM hard-float executable for compatible Kindle firmware. The executable is dynamically linked and requires the Kindle runtime libraries, including GTK, GStreamer, FAAD2, and LIPC.
 
-Extract the package to the root of your jailbroken Kindle and launch it using the included scriptlet or KUAL entry.
+Check the release notes and confirm your device model and firmware are supported before installing. The build in this repository is not a universal Kindle binary.
 
-*If no release package is available yet, the project is still under development.*
+## Install
 
-## Audiobookshelf
+Download a device-compatible package from [GitHub Releases](https://github.com/coderkitten123/LARK-Next/releases) when one is available. Extract the package to `/mnt/us/LARK` on the Kindle and launch LARK from KUAL or the included launcher. The launcher expects the executable to be named `larkplayer` for hard-float firmware; the legacy script also recognizes `larkplayer_pw2` for soft-float devices.
 
-LARK Next includes Audiobookshelf integration. You can configure your server connection in the application.
+If there is no release package yet, the repository contains source code rather than a ready-to-install bundle. A complete package must include the executable, launcher/KUAL files, and any runtime libraries that are not already present on the target Kindle.
 
-Your Kindle must have network access and be able to reach your Audiobookshelf server.
+## Audiobookshelf setup
 
-## Building
+Connect the Kindle to Wi-Fi and ensure it can reach your Audiobookshelf server. In LARK's Options screen, enable Audiobookshelf and enter the server address plus either:
 
-LARK Next uses CMake and C++11.
+- a username and password, or
+- an Audiobookshelf API key.
 
-The project requires a suitable Kindle cross-compilation toolchain and the required Kindle libraries. In particular, the FAAD2 libraries and headers must be available to the toolchain.
+Use an `http://` address. The current client does not support HTTPS. Tap **Test connection** to check the settings before browsing the library.
 
-For desktop UI development and testing, see [`preview/README.md`](preview/README.md) for the Linux host preview harness.
+## Build
 
-## Credits
+The supplied `armhf-toolchain.cmake` targets Kindle hard-float. It expects the `kindlehf` cross toolchain and target libraries for GTK2, GStreamer 0.10, FAAD2, LIPC, SQLite, and libxml2. See the comments in the toolchain file for its expected location and SDK setup.
 
-LARK Next is based on the original [LARKPlayer](https://github.com/kbarni/LARKPlayer) project by Barna Keresztes.
+Activate the `kindlehf` environment using `refs/x-compile.sh` from your koxtoolchain checkout (the script is not part of this repository). Then, from the repository root, configure and build with:
 
-The project also uses:
+```bash
+cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=armhf-toolchain.cmake
+cmake --build build -j2
+```
 
-- [KinAMP](https://github.com/kbarni/KinAMP) audio engine
-- [FAAD2](https://github.com/knik0/faad2) AAC decoder
-- [miniaudio](https://github.com/mackron/miniaudio)
-- [cJSON](https://github.com/DaveGamble/cJSON)
+The executable is written to `build/larkplayer`. This build uses the ARM hard-float ABI; it is not suitable for soft-float Kindle models.
 
-See the individual component licence and copyright notices in the source tree.
+For Linux desktop UI preview, see [`preview/README.md`](preview/README.md).
 
-## Licence
+## Project files
 
-LARK Next is licensed under the GNU General Public License v3 or later. See [LICENSE](LICENSE).
+- `assets/start_lark.sh` — Kindle launcher script
+- `assets/kual/` — KUAL menu and extension metadata
+- `armhf-toolchain.cmake` — hard-float Kindle cross-compilation configuration
+- `preview/` — desktop preview harness and fake Audiobookshelf server
+
+## Credits and licences
+
+LARK Next is based on [LARKPlayer](https://github.com/kbarni/LARKPlayer) by Barna Keresztes. It also uses KinAMP, FAAD2, miniaudio, and cJSON. See the relevant source directories for their copyright and licence notices.
+
+LARK Next is licensed under GNU GPL version 3 or, at your option, any later version. See [LICENSE](LICENSE).
