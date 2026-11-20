@@ -1,2 +1,15 @@
 build/
 *.o
+# Local development configuration
+opencode.json
+
+# Editor backups
+*.editbackup
+*~
+
+# Temporary patches
+*.patch
+
+# Compiled files
+*.o
+build/

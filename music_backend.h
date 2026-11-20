@@ -41,7 +41,9 @@ public:
 
     // Start decoding the specified file in a separate thread.
     // Returns true if thread started successfully.
-    bool start(const char* filepath, int start_time = 0);
+    // forced_format bypasses file-extension sniffing (needed for synthetic
+    // paths like "/proc/self/fd/7" that have no extension to sniff).
+    bool start(const char* filepath, int start_time = 0, AudioFormat forced_format = AudioFormat::UNKNOWN);
 
     // Stop the decoding thread.
     // This sets the stop flag and waits for the thread to join.
@@ -61,6 +63,7 @@ private:
     pthread_t thread_id;
     std::string current_filepath;
     int start_time;
+    AudioFormat forced_format;
 
     ErrorCallback on_error_callback;
     void* error_user_data;
@@ -92,7 +95,9 @@ public:
     ~MusicBackend();
 
     // --- Public API ---
-    void play_file(const char* filepath, int start_time = 0);
+    // forced_format bypasses file-extension sniffing (needed for synthetic
+    // paths like "/proc/self/fd/7" that have no extension to sniff).
+    void play_file(const char* filepath, int start_time = 0, AudioFormat forced_format = AudioFormat::UNKNOWN);
     void pause();
     void stop();
     
@@ -107,7 +112,7 @@ public:
     void set_eos_callback(EosCallback callback, void* user_data);
     void set_error_callback(ErrorCallback callback, void* user_data);
 
-    void read_metadata(const char* filepath);
+    void read_metadata(const char* filepath, AudioFormat forced_format = AudioFormat::UNKNOWN);
     
     std::string meta_title;
     std::string meta_artist;

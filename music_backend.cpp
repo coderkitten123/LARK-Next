@@ -28,6 +28,21 @@ static std::mutex mp4_mutex;
 
 const char* PIPE_PATH = "/tmp/kinamp_audio_pipe";
 
+static bool write_pcm_all(int fd, const void* data, size_t size) {
+    const char* bytes = static_cast<const char*>(data);
+    size_t written = 0;
+    while (written < size) {
+        ssize_t n = write(fd, bytes + written, size - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (n < 0 && errno != EPIPE) perror("Decoder: write error");
+            return false;
+        }
+        written += (size_t)n;
+    }
+    return true;
+}
+
 // =================================================================================
 // Helper Functions
 // =================================================================================
@@ -191,7 +206,7 @@ static ma_result StreamVFS_onInfo(ma_vfs* pVFS, ma_vfs_file file, ma_file_info* 
 // Decoder Implementation
 // =================================================================================
 
-Decoder::Decoder() : stop_flag(false), running(false), thread_id(0), on_error_callback(NULL), error_user_data(NULL), current_stream_pid(0) {
+Decoder::Decoder() : stop_flag(false), running(false), thread_id(0), forced_format(AudioFormat::UNKNOWN), on_error_callback(NULL), error_user_data(NULL), current_stream_pid(0) {
     unlink(PIPE_PATH);
     if (mkfifo(PIPE_PATH, 0666) == -1) {
         perror("Decoder: Failed to create named pipe");
@@ -203,13 +218,15 @@ Decoder::~Decoder() {
     unlink(PIPE_PATH);
 }
 
-bool Decoder::start(const char* filepath, int start_time) {
-    if (running) {
-        stop();
-    }
+bool Decoder::start(const char* filepath, int start_time, AudioFormat forced_format) {
+    // Reap a previous decoder thread even if it already marked itself stopped
+    // after rejecting an unsupported file. pthread_create handles remain
+    // joinable until explicitly joined.
+    if (thread_id != 0) stop();
 
     current_filepath = filepath;
     this->start_time = start_time;
+    this->forced_format = forced_format;
     stop_flag = false;
     running = true;
 
@@ -232,20 +249,21 @@ void Decoder::set_stream_pid(pid_t pid) {
 }
 
 void Decoder::stop() {
-    if (!running) return;
-
-    stop_flag = true;
+    bool was_running = running;
+    if (was_running) stop_flag = true;
 
     // Force kill the stream process if active to unblock fread/read
-    {
+    if (was_running) {
         std::lock_guard<std::mutex> lock(pid_mutex);
         if (current_stream_pid > 0) {
             kill(current_stream_pid, SIGTERM);
         }
     }
 
-    int fd = open(PIPE_PATH, O_RDONLY | O_NONBLOCK);
-    if (fd >= 0) close(fd);
+    if (was_running) {
+        int fd = open(PIPE_PATH, O_RDONLY | O_NONBLOCK);
+        if (fd >= 0) close(fd);
+    }
 
     if (thread_id != 0) {
         pthread_join(thread_id, NULL);
@@ -269,7 +287,9 @@ void Decoder::decode_loop() {
     g_print("Decoder: Starting for %s\n", current_filepath.c_str());
 
     InputType inputType = detect_input_type(current_filepath.c_str());
-    AudioFormat format = detect_format(current_filepath.c_str(), inputType);
+    AudioFormat format = (forced_format != AudioFormat::UNKNOWN)
+                             ? forced_format
+                             : detect_format(current_filepath.c_str(), inputType);
 
     if (inputType == InputType::STREAM) {
         decode_stream(current_filepath.c_str());
@@ -301,6 +321,8 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
     if (!hDecoder) {
         g_printerr("Decoder: Failed to open FAAD2 decoder\n");
         mp4read_close();
+        if (on_error_callback)
+            on_error_callback("Unable to initialize the AAC decoder.", error_user_data);
         return;
     }
 
@@ -315,6 +337,8 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
         g_printerr("Decoder: Failed to initialize FAAD2 with ASC\n");
         NeAACDecClose(hDecoder);
         mp4read_close();
+        if (on_error_callback)
+            on_error_callback("Unable to initialize the AAC audio stream.", error_user_data);
         return;
     }
     g_print("Decoder: M4B Init %lu Hz, %d channels\n", samplerate, channels);
@@ -349,6 +373,8 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
         perror("Decoder: Failed to open pipe");
         NeAACDecClose(hDecoder);
         mp4read_close();
+        if (on_error_callback)
+            on_error_callback("Unable to start the audio output.", error_user_data);
         return;
     }
 
@@ -376,15 +402,7 @@ void Decoder::decode_mp4_file(const char* filepath, int start_time) {
 
         if (frameInfo.samples > 0) {
             ssize_t to_write = frameInfo.samples * 2; 
-            ssize_t written = write(fd, sample_buffer, to_write);
-
-            if (written == -1) {
-                if (errno == EPIPE) {
-                    break;
-                }
-                perror("Decoder: write error");
-                break;
-            }
+            if (!write_pcm_all(fd, sample_buffer, (size_t)to_write)) break;
         }
     }
 
@@ -449,16 +467,8 @@ void Decoder::decode_miniaudio(const char* filepath, int start_time) {
             break;
         }
 
-        ssize_t to_write = frames_read * decoder.outputChannels * sizeof(int16_t);
-        ssize_t written = write(fd, pcm_buffer.data(), to_write);
-
-        if (written == -1) {
-            if (errno == EPIPE) {
-                break;
-            }
-            perror("Decoder: write error");
-            break;
-        }
+        size_t to_write = (size_t)(frames_read * decoder.outputChannels * sizeof(int16_t));
+        if (!write_pcm_all(fd, pcm_buffer.data(), to_write)) break;
         
         if (result == MA_AT_END) break;
     }
@@ -486,6 +496,8 @@ void Decoder::decode_stream(const char* url) {
     int fd = open(PIPE_PATH, O_WRONLY);
     if (fd == -1) {
         perror("Decoder: Failed to open pipe");
+        if (on_error_callback)
+            on_error_callback("Unable to start the audio output.", error_user_data);
         return;
     }
 
@@ -525,16 +537,8 @@ void Decoder::decode_stream(const char* url) {
             break;
         }
 
-        ssize_t to_write = frames_read * decoder.outputChannels * sizeof(int16_t);
-        ssize_t written = write(fd, pcm_buffer.data(), to_write);
-
-        if (written == -1) {
-            if (errno == EPIPE) {
-                break;
-            }
-            perror("Decoder: write error");
-            break;
-        }
+        size_t to_write = (size_t)(frames_read * decoder.outputChannels * sizeof(int16_t));
+        if (!write_pcm_all(fd, pcm_buffer.data(), to_write)) break;
         
         if (result == MA_AT_END) break;
     }
@@ -637,7 +641,7 @@ gint64 MusicBackend::get_position() {
     return last_position;
 }
 
-void MusicBackend::read_metadata(const char* filepath) {
+void MusicBackend::read_metadata(const char* filepath, AudioFormat forced_format) {
     meta_title.clear();
     meta_artist.clear();
     meta_album.clear();
@@ -651,7 +655,9 @@ void MusicBackend::read_metadata(const char* filepath) {
     metadata_filepath = filepath;
 
     InputType type = detect_input_type_helper(filepath);
-    AudioFormat format = detect_format_helper(filepath, type);
+    AudioFormat format = (forced_format != AudioFormat::UNKNOWN)
+                             ? forced_format
+                             : detect_format_helper(filepath, type);
 
     if (type == InputType::STREAM) { 
         return; 
@@ -721,7 +727,7 @@ void MusicBackend::read_metadata(const char* filepath) {
     }
 }
 
-void MusicBackend::play_file(const char* filepath, int start_time) {
+void MusicBackend::play_file(const char* filepath, int start_time, AudioFormat forced_format) {
     if (stopping) return;
 
     if (is_playing || is_paused) {
@@ -737,7 +743,7 @@ void MusicBackend::play_file(const char* filepath, int start_time) {
     } else if (metadata_filepath != filepath || total_duration <= 0) {
         // Skip the probe when metadata is already cached for this file:
         // for MP3 the duration query scans the entire file.
-        read_metadata(filepath);
+        read_metadata(filepath, forced_format);
     }
 
     g_print("Backend: Playing %s from %d\n", filepath, start_time);
@@ -764,8 +770,10 @@ void MusicBackend::play_file(const char* filepath, int start_time) {
     bus_watch_id = gst_bus_add_watch(bus, bus_callback_func, this);
     gst_object_unref(bus);
 
-    if (!decoder->start(filepath, start_time)) {
+    if (!decoder->start(filepath, start_time, forced_format)) {
         cleanup_pipeline();
+        is_playing = false;
+        is_paused = false;
         return;
     }
 

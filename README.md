@@ -1,91 +1,58 @@
-LARK - Libre Audiobook Reader for Kindle
-========================================
+# LARK Next
 
-<a href='https://ko-fi.com/E1E71RAR86' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi3.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a> <-- All proceeds go to charities.
+**LARK Next** is an enhanced continuation of [LARK (Libre Audiobook Reader for Kindle)](https://github.com/kbarni/LARKPlayer), a free audiobook player for jailbroken Kindle devices.
 
-LARK is a free **M4B/MP3** audiobook reader for jailbroken Kindles. **Only Firmware <5.19 supported right now. Working on a solution for newer devices**
+It builds on the original project with an improved interface, Audiobookshelf integration, and additional playback and usability improvements.
 
-![Screenshot](assets/screenshot.png)
+> **Compatibility:** The original project currently documents support for Kindle firmware below 5.19. Check compatibility with your device before installing.
 
-It supports audiobooks in MP3 format and M4B format/AAC encoding. When downloading audiobooks, make sure to choose these formats. AAC is the most common encoding for M4B audiobooks, however this format supports other encodings too.
+## Features
 
-Features
---------
+- MP3 and AAC-encoded M4B audiobook playback
+- Audiobookshelf server integration
+- Audiobook library browsing and book details
+- Playback session and progress integration
+- Listening history, bookmarks and chapter support
+- Improved interface and on-screen keyboard
+- E-ink display refresh handling
+- Audio and cover caching improvements
+- Backlight management
 
-- Support for MP3 files and AAC encoded M4B audiobooks
-- Uses [KinAMP](https://github.com/kbarni/KinAMP)'s audio engine and [FAAD2](https://github.com/knik0/faad2) decoder library
-- Optimized for e-book readers: minimum screen refreshes, backlight management
-- Listening history
-- Book metadata and chapter support
-- Bookmark support
-- Scriptlet and KUAL launcher included
+## Installation
 
-Installation and usage
------------------------
+Download the latest available package from the [LARK Next Releases](https://github.com/coderkitten123/LARK-Next/releases) page.
 
-Grab the latest relase from the [Releases](https://github.com/kbarni/LARKPlayer/releases) page. Unzip it to the root of your Kindle.
+Extract the package to the root of your jailbroken Kindle and launch it using the included scriptlet or KUAL entry.
 
-Start it from the library using the provided scriptlet or from KUAL.
+*If no release package is available yet, the project is still under development.*
 
-![Buttons](assets/buttons.png)
+## Audiobookshelf
 
-Getting free audio books
-------------------------
+LARK Next includes Audiobookshelf integration. You can configure your server connection in the application.
 
-[Librivox](https://librivox.org/search) has a good list of free public domain audiobooks created by the community. To get their books in M4B format, look for the *Download M4B" link at the bottom of the left column.
+Your Kindle must have network access and be able to reach your Audiobookshelf server.
 
-You can create your own M4B files from other audio files (like MP3) using the excellent [AudiobookConverter](https://github.com/yermak/AudioBookConverter) or [M4B-Tool](https://github.com/sandreas/m4b-tool/tree/master) converters.
+## Building
 
+LARK Next uses CMake and C++11.
 
-Planned features
-----------------
+The project requires a suitable Kindle cross-compilation toolchain and the required Kindle libraries. In particular, the FAAD2 libraries and headers must be available to the toolchain.
 
-- AudioBookShelf support
+For desktop UI development and testing, see [`preview/README.md`](preview/README.md) for the Linux host preview harness.
 
-Troubleshooting
----------------
+## Credits
 
-If LARK player doesn't start, try to start it from `kterm` and submit an issue with the error you get.
+LARK Next is based on the original [LARKPlayer](https://github.com/kbarni/LARKPlayer) project by Barna Keresztes.
 
-```
-cd LARK
-./start_lark.sh
-```
-Building
---------
+The project also uses:
 
-You must create your CMake toolchain file for your cross-compile toolchain.
+- [KinAMP](https://github.com/kbarni/KinAMP) audio engine
+- [FAAD2](https://github.com/knik0/faad2) AAC decoder
+- [miniaudio](https://github.com/mackron/miniaudio)
+- [cJSON](https://github.com/DaveGamble/cJSON)
 
-You also need to get libfaad2 libraries (`.so`) and include (`.h`) files or [build them from source](https://github.com/knik0/faad2).
+See the individual component licence and copyright notices in the source tree.
 
-```
-git clone 
-cd LARK
-mkdir build
-cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=armhf-toolchain.cmake
-make
-```
+## Licence
 
-Changelog
----------
-
-- Version 2.6 - 3/10/2026
-    - Low resolution devices support
-    - Closing bugs fixed
-    - Disappearing database fixed
-- Version 2.5 - 1/17/2026
-    - MP3 format support
-    - PW2 (soft-float) models support
-- Version 2.0 - 1/10/2026
-    - History stored in SQLite database
-    - Chapter selection
-    - Bookmark support
-    - Bugfixes and cosmetic changes
-- Version 1.0 - 1/3/2026
-    - Initial release
-
-License
--------
-
-This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License** as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with this program. If not, see <http://www.gnu.org/licenses/>.
+LARK Next is licensed under the GNU General Public License v3 or later. See [LICENSE](LICENSE).
