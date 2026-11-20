@@ -39,7 +39,7 @@ options_ui.cpp when present) on the Linux host against fakes, and renders them i
     ./swipe.sh X1 Y1 X2 Y2 [steps] [step_ms]   # press/drag/release (kinetic scroll tests)
 ```
 
-`configured` seeds abs_server=http://127.0.0.1:8099, abs_token=key123, abs_enabled=1, abs_user=liam, abs_pass=secret.
+`configured` seeds abs_server=http://127.0.0.1:8099, abs_token=key123, abs_enabled=1, abs_user=, abs_pass=secret.
 `fresh` deletes the settings file. App env: `LARK_WINDOW_SIZE=1072x1448` is set (used only if the app honours it).
 
 ## Caveats
