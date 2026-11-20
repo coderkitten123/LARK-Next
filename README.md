@@ -21,7 +21,8 @@ Check the release notes and confirm your device model and firmware are supported
 
 ## Install
 
-Download a device-compatible package from [GitHub Releases](https://github.com/coderkitten123/LARK-Next/releases) when one is available. Extract the package to `/mnt/us/LARK` on the Kindle and launch LARK from KUAL or the included launcher. The launcher expects the executable to be named `larkplayer` for hard-float firmware; the legacy script also recognizes `larkplayer_pw2` for soft-float devices.
+Download a release from [GitHub Releases](https://github.com/coderkitten123/LARK-Next/releases)
+Extract the package to `/mnt/us/` , the contents of `documents` and `extensions` to their respective places on the Kindle and launch LARK from KUAL (or KUAL-Next) or the included launcher booklet. The launcher expects the executable to be named `larkplayer` for hard-float firmware.
 
 If there is no release package yet, the repository contains source code rather than a ready-to-install bundle. A complete package must include the executable, launcher/KUAL files, and any runtime libraries that are not already present on the target Kindle.
 
