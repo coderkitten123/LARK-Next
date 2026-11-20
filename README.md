@@ -1,6 +1,7 @@
 # LARK Next
 
 LARK Next is a free audiobook player for jailbroken Kindle devices. It continues the [LARKPlayer project](https://github.com/kbarni/LARKPlayer) with a refreshed interface, Audiobookshelf support, and playback improvements.
+**WARNING** *AI tools assisted with parts of the code review, bug fixes, and documentation for LARK Next. The project was reviewed and tested by the maintainer, including on a Kindle device.*
 
 ## Features
 
