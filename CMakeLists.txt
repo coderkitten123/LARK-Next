@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(GTK IMPORTED_TARGET REQUIRED gtk+-2.0)
+pkg_check_modules(GIO IMPORTED_TARGET REQUIRED gio-2.0)
 pkg_check_modules(XML IMPORTED_TARGET REQUIRED libxml-2.0)
 pkg_check_modules(SQLite IMPORTED_TARGET REQUIRED sqlite3)
 #pkg_check_modules(GLIB REQUIRED glib-2.0)
@@ -34,6 +35,7 @@ add_executable(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     PkgConfig::GTK
+    PkgConfig::GIO
     PkgConfig::XML
     PkgConfig::SQLite
     Threads::Threads

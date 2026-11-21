@@ -27,6 +27,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <ctime>
+#include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -40,6 +42,10 @@
 #include "icons.h"
 #include "ui_kit.h"
 #include "ram_cache.h"
+
+extern "C" {
+#include "third_party/cJSON/cJSON.h"
+}
 
 // --- externs to m4b_player.cpp globals ---
 extern MusicBackend backend;
@@ -68,6 +74,175 @@ AbsClient gAbs;
 // repeat multi-MB audio writes.
 static const char* ABS_CACHE_DIR = "/mnt/us/abs_cache";
 static const char* ABS_COVER_DIR = "/mnt/us/abs_covers";
+static const char* ABS_DOWNLOAD_EXT = ".abs.json";
+
+struct AbsDownload {
+    AbsItem item;
+    std::vector<AbsChapter> chapters;
+    std::vector<AbsTrack> tracks;
+};
+
+static bool abs_safe_item_id(const std::string& id) {
+    if (id.empty()) return false;
+    for (size_t i = 0; i < id.size(); ++i) {
+        unsigned char c = (unsigned char)id[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+    }
+    return true;
+}
+
+static std::string abs_download_manifest_path(const std::string& id) {
+    if (!abs_safe_item_id(id)) return "";
+    return std::string(ABS_CACHE_DIR) + "/" + id + ABS_DOWNLOAD_EXT;
+}
+
+static std::string abs_download_track_path(const std::string& id, int index) {
+    if (!abs_safe_item_id(id) || index <= 0) return "";
+    char path[320];
+    snprintf(path, sizeof(path), "%s/%s_%d.mp3", ABS_CACHE_DIR, id.c_str(), index);
+    return path;
+}
+
+static bool abs_save_download_manifest(const AbsDownload& d) {
+    std::string path = abs_download_manifest_path(d.item.id);
+    if (path.empty()) return false;
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return false;
+    cJSON_AddStringToObject(root, "id", d.item.id.c_str());
+    cJSON_AddStringToObject(root, "title", d.item.title.c_str());
+    cJSON_AddStringToObject(root, "author", d.item.author.c_str());
+    cJSON_AddNumberToObject(root, "duration", d.item.duration);
+    cJSON* chapters = cJSON_CreateArray();
+    for (size_t i = 0; i < d.chapters.size(); ++i) {
+        cJSON* ch = cJSON_CreateObject();
+        cJSON_AddNumberToObject(ch, "start", d.chapters[i].start);
+        cJSON_AddNumberToObject(ch, "end", d.chapters[i].end);
+        cJSON_AddStringToObject(ch, "title", d.chapters[i].title.c_str());
+        cJSON_AddItemToArray(chapters, ch);
+    }
+    cJSON_AddItemToObject(root, "chapters", chapters);
+    cJSON* tracks = cJSON_CreateArray();
+    for (size_t i = 0; i < d.tracks.size(); ++i) {
+        cJSON* tr = cJSON_CreateObject();
+        cJSON_AddNumberToObject(tr, "index", d.tracks[i].index);
+        cJSON_AddNumberToObject(tr, "start", d.tracks[i].start_offset);
+        cJSON_AddNumberToObject(tr, "duration", d.tracks[i].duration);
+        cJSON_AddStringToObject(tr, "mime", d.tracks[i].mime_type.c_str());
+        cJSON_AddItemToArray(tracks, tr);
+    }
+    cJSON_AddItemToObject(root, "tracks", tracks);
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return false;
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    bool ok = f && fwrite(json, 1, strlen(json), f) == strlen(json);
+    if (f && fclose(f) != 0) ok = false;
+    free(json);
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static std::string abs_json_string(const cJSON* obj, const char* key, const char* fallback = "") {
+    cJSON* node = obj ? cJSON_GetObjectItemCaseSensitive(obj, key) : NULL;
+    return cJSON_IsString(node) && node->valuestring ? node->valuestring : fallback;
+}
+
+static double abs_json_number(const cJSON* obj, const char* key, double fallback = 0.0) {
+    cJSON* node = obj ? cJSON_GetObjectItemCaseSensitive(obj, key) : NULL;
+    return cJSON_IsNumber(node) ? node->valuedouble : fallback;
+}
+
+static bool abs_load_download_manifest(const std::string& path, AbsDownload& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long size = ftell(f);
+    if (size <= 0 || size > 1024 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f); return false;
+    }
+    std::vector<char> bytes((size_t)size + 1);
+    size_t got = fread(&bytes[0], 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) return false;
+    bytes[got] = '\0';
+    cJSON* root = cJSON_Parse(&bytes[0]);
+    if (!root) return false;
+    AbsDownload d;
+    d.item.id = abs_json_string(root, "id");
+    d.item.title = abs_json_string(root, "title");
+    d.item.author = abs_json_string(root, "author");
+    d.item.duration = abs_json_number(root, "duration");
+    d.item.progress = 0;
+    d.item.finished = false;
+    d.item.num_tracks = 0;
+    d.item.num_chapters = 0;
+    cJSON* chapters = cJSON_GetObjectItemCaseSensitive(root, "chapters");
+    cJSON* node;
+    cJSON_ArrayForEach(node, chapters) {
+        AbsChapter ch;
+        ch.start = abs_json_number(node, "start");
+        ch.end = abs_json_number(node, "end");
+        ch.title = abs_json_string(node, "title");
+        d.chapters.push_back(ch);
+    }
+    cJSON* tracks = cJSON_GetObjectItemCaseSensitive(root, "tracks");
+    cJSON_ArrayForEach(node, tracks) {
+        AbsTrack tr;
+        tr.index = (int)abs_json_number(node, "index");
+        tr.start_offset = abs_json_number(node, "start");
+        tr.duration = abs_json_number(node, "duration");
+        tr.mime_type = abs_json_string(node, "mime", "audio/mpeg");
+        if (tr.index <= 0 || abs_download_track_path(d.item.id, tr.index).empty()) continue;
+        struct stat st;
+        if (stat(abs_download_track_path(d.item.id, tr.index).c_str(), &st) != 0 || st.st_size <= 0) {
+            cJSON_Delete(root);
+            return false;
+        }
+        tr.content_url = abs_download_track_path(d.item.id, tr.index);
+        d.tracks.push_back(tr);
+    }
+    cJSON_Delete(root);
+    if (!abs_safe_item_id(d.item.id) || d.tracks.empty()) return false;
+    d.item.num_tracks = (int)d.tracks.size();
+    d.item.num_chapters = (int)d.chapters.size();
+    out = d;
+    return true;
+}
+
+static std::vector<AbsDownload> abs_list_downloads() {
+    std::vector<AbsDownload> out;
+    DIR* dir = opendir(ABS_CACHE_DIR);
+    if (!dir) return out;
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != NULL) {
+        std::string name = ent->d_name;
+        size_t ext = name.size() >= strlen(ABS_DOWNLOAD_EXT) ? name.size() - strlen(ABS_DOWNLOAD_EXT) : std::string::npos;
+        if (ext == std::string::npos || name.compare(ext, std::string::npos, ABS_DOWNLOAD_EXT) != 0) continue;
+        AbsDownload d;
+        if (abs_load_download_manifest(std::string(ABS_CACHE_DIR) + "/" + name, d)) {
+            char key[256];
+            snprintf(key, sizeof(key), "abs_download_pos_%s", d.item.id.c_str());
+            d.item.progress = atof(db.getSetting(key, "0").c_str());
+            out.push_back(d);
+        }
+    }
+    closedir(dir);
+    return out;
+}
+
+static void abs_remove_download(const AbsDownload& d) {
+    for (size_t i = 0; i < d.tracks.size(); ++i)
+        remove(abs_download_track_path(d.item.id, d.tracks[i].index).c_str());
+    remove(abs_download_manifest_path(d.item.id).c_str());
+    char key[256];
+    snprintf(key, sizeof(key), "abs_download_pos_%s", d.item.id.c_str());
+    db.setSetting(key, "");
+}
 // Browse page size is set per view mode (cover grid vs list); see the
 // browser section. Small pages keep list/grid building instant — laying out
 // hundreds of GTK rows in one go was a major source of UI lag on the Kindle.
@@ -75,6 +250,7 @@ static const int   ABS_SYNC_INTERVAL = 15;   // ticks (1s each) between /sync ca
 
 struct AbsPlayback {
     bool active = false;
+    bool offline = false;
     std::string session_id;
     std::string item_id;
     std::string book_title;
@@ -96,6 +272,14 @@ struct AbsPlayback {
     int next_fd_idx = -1;
 };
 static AbsPlayback ap;
+
+static void abs_store_offline_position(double position) {
+    if (!ap.offline || ap.item_id.empty()) return;
+    char key[256], value[48];
+    snprintf(key, sizeof(key), "abs_download_pos_%s", ap.item_id.c_str());
+    snprintf(value, sizeof(value), "%.0f", position < 0 ? 0 : position);
+    db.setSetting(key, value);
+}
 
 // Guesses the local decoder format from an Audiobookshelf track's MIME type,
 // so a RAM-backed "/proc/self/fd/N" path (no file extension to sniff) still
@@ -356,7 +540,7 @@ static void abs_play_now(int idx, double offset_in_track, const std::string& pat
     // RAM first (bounded by ram_track_budget), falling back to the disk cache
     // only when the format can't be stream-detected or memory is tight.
     int next = idx + 1;
-    if (next < (int)ap.tracks.size() && ap.next_fd < 0) {
+    if (!ap.offline && next < (int)ap.tracks.size() && ap.next_fd < 0) {
         const AbsTrack& nt = ap.tracks[next];
         AudioFormat nforced = abs_format_for_mime(nt.mime_type);
         std::string url = nt.content_url;
@@ -397,8 +581,10 @@ static void abs_play_now(int idx, double offset_in_track, const std::string& pat
         });
     }
 
-    // Full e-ink refresh clears ghosting from the previous track's labels
-    eink_full_refresh();
+    // Update the time labels before asking the e-ink driver to repaint. A
+    // direct ioctl here raced GTK's queued label redraw on Kindle.
+    abs_time_display(dispUpdate);
+    app_schedule_refresh(false);
 }
 
 static void abs_begin_track(int idx, double offset_in_track) {
@@ -418,7 +604,7 @@ static void abs_begin_track(int idx, double offset_in_track) {
 
     player_set_book(ap.book_title, ap.book_author);
     player_apply_display_mode();
-    abs_load_cover(ap.item_id);
+    if (!ap.offline) abs_load_cover(ap.item_id);
 
     guint gen = ++g_track_gen;
     AudioFormat forced = abs_format_for_mime(tr.mime_type);
@@ -528,6 +714,17 @@ void abs_on_eos() {
         // Book finished
         g_print("ABS: book finished\n");
         double dur = ap.book_duration > 0 ? ap.book_duration : ap.book_position;
+        if (ap.offline) {
+            abs_store_offline_position(dur);
+            ap.track_idx = -1;
+            ap.active = false;
+            ap.book_position = dur;
+            ap.busy_msg.clear();
+            abs_close_ram_fds();
+            player_set_info("Finished", "", "");
+            app_schedule_refresh(false);
+            return;
+        }
         std::string iid = ap.item_id;
         std::string sid = ap.session_id;
         double delta = dur - ap.last_sync_position;
@@ -573,7 +770,7 @@ void abs_sync_tick() {
 // Audiobookshelf client (or this same book reopened later) sees a position
 // that is at most a few seconds stale, not up to a whole tick interval old.
 void abs_force_sync() {
-    if (!ap.active || ap.session_id.empty()) return;
+    if (!ap.active) return;
 
     double cur = ap.book_position;
     if (backend.is_playing && ap.track_idx >= 0 && ap.track_idx < (int)ap.tracks.size()) {
@@ -583,6 +780,13 @@ void abs_force_sync() {
     double delta = cur - ap.last_sync_position;
     if (delta < 0) delta = 0;   // seeked backwards
     double dur = ap.book_duration > 0 ? ap.book_duration : 0;
+    if (ap.offline) {
+        abs_store_offline_position(cur);
+        ap.last_sync_position = cur;
+        ap.last_sync_tick = 0;
+        return;
+    }
+    if (ap.session_id.empty()) return;
     std::string sid = ap.session_id;
     std::string item = ap.item_id;
 
@@ -674,11 +878,15 @@ static void abs_finalize_session(const std::string& sid, double cur,
 
 void abs_shutdown() {
     if (!ap.active) return;
-    abs_finalize_session(ap.session_id, ap.book_position, ap.last_sync_position,
-                         ap.book_duration > 0 ? ap.book_duration : 0, true);
+    if (backend.is_playing && ap.track_idx >= 0 && ap.track_idx < (int)ap.tracks.size())
+        ap.book_position = ap.tracks[ap.track_idx].start_offset + backend.get_position() / (double)GST_SECOND;
+    if (ap.offline) abs_store_offline_position(ap.book_position);
+    else abs_finalize_session(ap.session_id, ap.book_position, ap.last_sync_position,
+                              ap.book_duration > 0 ? ap.book_duration : 0, true);
     g_print("ABS: session finalized at %.0fs\n", ap.book_position);
     ap.session_id.clear();
     ap.active = false;
+    ap.offline = false;
     abs_close_ram_fds();
 }
 
@@ -727,6 +935,14 @@ static gpointer abs_final_sync_thread(gpointer) {
 
 void abs_begin_shutdown_sync() {
     g_final_args = NULL;
+    if (ap.active && ap.offline) {
+        if (backend.is_playing && ap.track_idx >= 0 && ap.track_idx < (int)ap.tracks.size())
+            ap.book_position = ap.tracks[ap.track_idx].start_offset + backend.get_position() / (double)GST_SECOND;
+        abs_store_offline_position(ap.book_position);
+        ap.active = false;
+        g_final_done = TRUE;
+        return;
+    }
     if (ap.active && ap.session_id.size()) {
         FinalSyncArgs* a = new FinalSyncArgs();
         a->sid         = ap.session_id;
@@ -830,6 +1046,7 @@ static void abs_play_item(const std::string& item_id, const std::string& title,
                 return;
             }
             ap.active = true;
+            ap.offline = false;
             ap.session_id = r->session_id;
             ap.item_id = r->item_id;
             ap.book_title = r->title;
@@ -864,6 +1081,45 @@ static void abs_play_item(const std::string& item_id, const std::string& title,
             abs_begin_track(idx, offset);
         });
     });
+}
+
+static void abs_play_downloaded(const AbsDownload& d) {
+    if (ap.active) abs_shutdown();
+    backend.stop();
+    ++g_load_gen;
+    abs_close_ram_fds();
+    ap.active = true;
+    ap.offline = true;
+    ap.session_id.clear();
+    ap.item_id = d.item.id;
+    ap.book_title = d.item.title;
+    ap.book_author = d.item.author;
+    ap.busy_msg.clear();
+    ap.book_duration = d.item.duration;
+    ap.last_sync_position = 0;
+    ap.last_sync_tick = 0;
+    ap.chapters = d.chapters;
+    ap.tracks = d.tracks;
+    player_set_book(ap.book_title, ap.book_author);
+    player_set_cover(NULL);
+    player_apply_display_mode();
+
+    char key[256];
+    snprintf(key, sizeof(key), "abs_download_pos_%s", ap.item_id.c_str());
+    double start_at = atof(db.getSetting(key, "0").c_str());
+    if (ap.book_duration > 0 && start_at >= ap.book_duration) start_at = 0;
+    int idx = 0;
+    for (size_t i = 0; i < ap.tracks.size(); ++i) {
+        if (start_at >= ap.tracks[i].start_offset &&
+            start_at < ap.tracks[i].start_offset + ap.tracks[i].duration) {
+            idx = (int)i;
+            break;
+        }
+    }
+    double offset = start_at - ap.tracks[idx].start_offset;
+    if (offset < 0) offset = 0;
+    g_print("ABS: playing downloaded '%s' at %.0fs\n", ap.book_title.c_str(), start_at);
+    abs_begin_track(idx, offset);
 }
 
 // ---------------------------------------------------------------------------------
@@ -1032,6 +1288,7 @@ static GtkWidget* lib_content = NULL;
 static GtkWidget* lib_search_btn = NULL;
 static GtkWidget* lib_view_btn = NULL;
 static GtkWidget* lib_open_btn = NULL;
+static GtkWidget* lib_local_btn = NULL;
 
 static std::vector<AbsItem> abs_page_items;
 static std::vector<GtkWidget*> abs_row_covers;   // cover image widget per card/row
@@ -1046,6 +1303,9 @@ static bool abs_grid_view = true;
 static bool lib_ready = false;      // a page of books is showing
 static bool lib_connecting = false;
 static bool lib_local_mode = false;
+static bool abs_download_mode = false;
+static bool abs_download_busy = false;
+static std::vector<AbsDownload> abs_download_items;
 
 // Small pages keep building fast: laying out hundreds of GTK widgets in one go
 // was a major source of UI lag on the Kindle.
@@ -1106,18 +1366,26 @@ static void lib_update_toolbar() {
     if (lib_local_mode) {
         gtk_widget_hide(lib_search_btn);
         gtk_widget_hide(lib_view_btn);
+        gtk_widget_show(lib_local_btn);
+        ui_button_set_text(lib_local_btn, "ABS");
         gtk_widget_show(lib_open_btn);
+        ui_button_set_text(lib_open_btn, "Open file");
     } else {
         gtk_widget_show(lib_search_btn);
         gtk_widget_show(lib_view_btn);
-        gtk_widget_hide(lib_open_btn);
+        gtk_widget_show(lib_local_btn);
+        ui_button_set_text(lib_local_btn, "Local");
+        gtk_widget_show(lib_open_btn);
+        ui_button_set_text(lib_open_btn, abs_download_mode ? "Library" : "Downloads");
         ui_button_set_text(lib_search_btn, abs_cur_search.empty() ? "Search" : "Clear");
         ui_button_set_text(lib_view_btn, abs_grid_view ? "List" : "Grid");
     }
 }
 
-static void abs_load_page(int page, const std::string& search);
+static void abs_load_page(int page, const std::string& search, bool keep_visible = false);
 static void lib_connect_and_load(const AbsCfg& c);
+static void lib_show_downloads();
+static void lib_show_local();
 
 // --- cards -------------------------------------------------------------------------
 
@@ -1147,11 +1415,82 @@ static GtkWidget* lib_cover_new(int box_w, int box_h) {
 }
 
 static void on_lib_play(GtkWidget*, gpointer idx) {
+    if (abs_download_mode) {
+        size_t i = (size_t)GPOINTER_TO_INT(idx);
+        if (i >= abs_download_items.size()) return;
+        abs_play_downloaded(abs_download_items[i]);
+        app_show_tab(TAB_PLAY);
+        return;
+    }
     size_t i = (size_t)GPOINTER_TO_INT(idx);
     if (i >= abs_page_items.size()) return;
     AbsItem it = abs_page_items[i];
     abs_play_item(it.id, it.title, it.author);
     app_show_tab(TAB_PLAY);
+}
+
+static void on_lib_download(GtkWidget*, gpointer idx) {
+    size_t i = (size_t)GPOINTER_TO_INT(idx);
+    if (i >= abs_page_items.size()) return;
+    if (abs_download_busy) {
+        lib_set_status("A download is already running.");
+        return;
+    }
+    AbsItem item = abs_page_items[i];
+    AbsCfg cfg = abs_read_cfg();
+    abs_download_busy = true;
+    lib_set_status("Preparing download...");
+    abs_async([item, cfg] {
+        abs_apply_cfg(cfg);
+        AbsDownload d;
+        d.item = item;
+        double current = 0, user_duration = 0;
+        std::vector<AbsTrack> source_tracks;
+        bool ok = gAbs.getItemDetail(item.id, d.chapters, source_tracks, current, user_duration) &&
+                  !source_tracks.empty();
+        if (ok && user_duration > 0) d.item.duration = user_duration;
+        std::string session_id;
+        if (ok) ok = gAbs.startPlayback(item.id, session_id, d.tracks) &&
+                     !session_id.empty() && !d.tracks.empty();
+        if (ok) mkdir(ABS_CACHE_DIR, 0777);
+        for (size_t n = 0; ok && n < d.tracks.size(); ++n) {
+            const size_t part_number = n + 1;
+            const size_t part_total = d.tracks.size();
+            const std::string download_title = item.title;
+            abs_idle([part_number, part_total, download_title] {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "Downloading %s (%zu/%zu parts)...",
+                         download_title.c_str(), part_number, part_total);
+                lib_set_status(msg);
+            });
+            std::string path = abs_download_track_path(item.id, d.tracks[n].index);
+            if (path.empty()) { ok = false; break; }
+            struct stat st;
+            if (stat(path.c_str(), &st) != 0 || st.st_size <= 0) {
+                std::string part = path + ".part";
+                remove(part.c_str());
+                int fd = open(part.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+                long long bytes = 0;
+                ok = fd >= 0 && gAbs.downloadToFd(d.tracks[n].content_url, fd, -1, bytes);
+                if (fd >= 0) close(fd);
+                ok = ok && bytes > 0 && rename(part.c_str(), path.c_str()) == 0;
+                if (!ok) remove(part.c_str());
+            }
+        }
+        if (!session_id.empty() && !gAbs.closeSession(session_id))
+            g_print("ABS: could not close download session %s\n", session_id.c_str());
+        if (ok) ok = abs_save_download_manifest(d);
+        const std::string title = item.title;
+        abs_idle([ok, title] {
+            abs_download_busy = false;
+            if (ok) {
+                lib_set_status(("Downloaded " + title + " for offline listening.").c_str());
+                if (abs_download_mode) lib_show_downloads();
+            } else {
+                lib_set_status(("Download failed for " + title + ". Check Wi-Fi and free space.").c_str());
+            }
+        });
+    });
 }
 
 static std::string lib_listened_text(const AbsItem& it) {
@@ -1187,7 +1526,10 @@ static GtkWidget* lib_make_cell(const AbsItem& it, size_t index) {
     ui_button_set_icon(play, UI_ICON_PLAY, 62);
     ui_connect(play, on_lib_play, GINT_TO_POINTER((int)index));
     lib_slot(vb, play, 80);
-    gtk_box_pack_start(GTK_BOX(vb), ui_vspace(44), FALSE, FALSE, 0);
+    GtkWidget* download = ui_button_new("DOWNLOAD", 28, 320, 66, 4, 10);
+    ui_connect(download, on_lib_download, GINT_TO_POINTER((int)index));
+    lib_slot(vb, download, 66);
+    gtk_box_pack_start(GTK_BOX(vb), ui_vspace(24), FALSE, FALSE, 0);
 
     GtkWidget* a = gtk_alignment_new(0.5, 0, 0, 0);
     gtk_container_add(GTK_CONTAINER(a), vb);
@@ -1214,20 +1556,104 @@ static GtkWidget* lib_make_row(const AbsItem& it, size_t index) {
         gtk_box_pack_start(GTK_BOX(info), ui_label_new(prog, 24, false, false, 0.0, 500, 77),
                            FALSE, FALSE, 0);
     GtkWidget* info_a = gtk_alignment_new(0, 0.5, 1, 0);
+    gtk_widget_set_size_request(info_a, ui_px(360), -1);
     gtk_container_add(GTK_CONTAINER(info_a), info);
     gtk_box_pack_start(GTK_BOX(row), info_a, TRUE, TRUE, 0);
 
-    GtkWidget* play = ui_button_new("PLAY", 32, 210, 72, 4, 12);
+    GtkWidget* actions = gtk_vbox_new(FALSE, ui_px(8));
+    GtkWidget* play = ui_button_new("PLAY", 30, 165, 64, 4, 10);
     ui_button_set_icon(play, UI_ICON_PLAY, 44);
     ui_connect(play, on_lib_play, GINT_TO_POINTER((int)index));
-    GtkWidget* play_a = gtk_alignment_new(0.5, 0.5, 0, 0);
-    gtk_container_add(GTK_CONTAINER(play_a), play);
-    gtk_box_pack_start(GTK_BOX(row), play_a, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(actions), play, FALSE, FALSE, 0);
+    GtkWidget* download = ui_button_new("SAVE", 26, 165, 58, 3, 8);
+    ui_connect(download, on_lib_download, GINT_TO_POINTER((int)index));
+    gtk_box_pack_start(GTK_BOX(actions), download, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), actions, FALSE, FALSE, 0);
 
     GtkWidget* pad = gtk_alignment_new(0, 0, 1, 1);
     gtk_alignment_set_padding(GTK_ALIGNMENT(pad), ui_px(14), ui_px(14), ui_px(30), ui_px(30));
     gtk_container_add(GTK_CONTAINER(pad), row);
     return pad;
+}
+
+static void on_lib_remove_download(GtkWidget*, gpointer idx) {
+    size_t i = (size_t)GPOINTER_TO_INT(idx);
+    if (i >= abs_download_items.size()) return;
+    const AbsDownload d = abs_download_items[i];
+    if (ap.active && ap.item_id == d.item.id) {
+        lib_set_status("Stop this book before removing its download.");
+        return;
+    }
+    GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+        "Remove the downloaded copy of %s?", d.item.title.c_str());
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    if (response == GTK_RESPONSE_YES) {
+        abs_remove_download(d);
+        lib_show_downloads();
+    }
+}
+
+static void lib_show_downloads() {
+    abs_download_mode = true;
+    lib_update_toolbar();
+    abs_clear_list();
+    abs_download_items = abs_list_downloads();
+    if (abs_download_items.empty()) {
+        lib_show_message("No books downloaded yet.\nUse DOWNLOAD beside a library book to save it for offline listening.",
+                         NULL, NULL);
+        lib_set_status("Downloads");
+        return;
+    }
+    for (size_t i = 0; i < abs_download_items.size(); ++i) {
+        const AbsDownload& d = abs_download_items[i];
+        GtkWidget* row = gtk_hbox_new(FALSE, ui_px(24));
+        GtkWidget* info = gtk_vbox_new(FALSE, ui_px(4));
+        gtk_box_pack_start(GTK_BOX(info),
+            ui_label_new(trunc_str(d.item.title, 90), 30, true, false, 0.0, 520, 26, 2),
+            FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(info),
+            ui_label_new(d.item.author, 25, false, true, 0.0, 520, 51), FALSE, FALSE, 0);
+        char detail[96];
+        snprintf(detail, sizeof(detail), "Offline · %zu parts · %s", d.tracks.size(), fmt_time(d.item.duration).c_str());
+        gtk_box_pack_start(GTK_BOX(info), ui_label_new(detail, 24, false, false, 0.0, 520, 77), FALSE, FALSE, 0);
+        GtkWidget* info_a = gtk_alignment_new(0, 0.5, 1, 0);
+        gtk_container_add(GTK_CONTAINER(info_a), info);
+        gtk_box_pack_start(GTK_BOX(row), info_a, TRUE, TRUE, 0);
+
+        GtkWidget* actions = gtk_vbox_new(FALSE, ui_px(8));
+        GtkWidget* play = ui_button_new("PLAY", 30, 165, 64, 4, 10);
+        ui_button_set_icon(play, UI_ICON_PLAY, 42);
+        ui_connect(play, on_lib_play, GINT_TO_POINTER((int)i));
+        gtk_box_pack_start(GTK_BOX(actions), play, FALSE, FALSE, 0);
+        GtkWidget* remove_btn = ui_button_new("REMOVE", 24, 165, 56, 3, 8);
+        ui_connect(remove_btn, on_lib_remove_download, GINT_TO_POINTER((int)i));
+        gtk_box_pack_start(GTK_BOX(actions), remove_btn, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), actions, FALSE, FALSE, 0);
+
+        GtkWidget* pad = gtk_alignment_new(0, 0.5, 1, 1);
+        gtk_alignment_set_padding(GTK_ALIGNMENT(pad), ui_px(14), ui_px(14), ui_px(30), ui_px(30));
+        gtk_container_add(GTK_CONTAINER(pad), row);
+        gtk_box_pack_start(GTK_BOX(lib_content), pad, FALSE, FALSE, 0);
+        if (i + 1 < abs_download_items.size())
+            gtk_box_pack_start(GTK_BOX(lib_content), ui_rule(2), FALSE, FALSE, 0);
+    }
+    gtk_widget_show_all(lib_content);
+    lib_set_status((std::to_string(abs_download_items.size()) + " downloaded books").c_str());
+    ui_scroll_to_top(lib_scroll);
+    app_schedule_refresh(false);
+}
+
+static void on_lib_downloads(GtkWidget*, gpointer) {
+    if (abs_download_mode) {
+        abs_download_mode = false;
+        lib_update_toolbar();
+        if (lib_ready) abs_load_page(abs_page, abs_cur_search);
+        else lib_page_activate();
+    } else {
+        lib_show_downloads();
+    }
 }
 
 static void on_lib_prev(GtkWidget*, gpointer) {
@@ -1353,14 +1779,19 @@ static void on_lib_retry(GtkWidget*, gpointer) {
     lib_page_activate();
 }
 
-static void abs_load_page(int page, const std::string& search) {
-    abs_clear_list();
-    lib_show_message("Loading...", NULL, NULL);
-    guint gen = abs_page_gen;   // lib_show_message -> abs_clear_list bumped it
+static void abs_load_page(int page, const std::string& search, bool keep_visible) {
+    if (keep_visible && !abs_page_items.empty()) {
+        ++abs_page_gen;
+        lib_set_status("Refreshing library...");
+    } else {
+        abs_clear_list();
+        lib_show_message("Loading...", NULL, NULL);
+    }
+    guint gen = abs_page_gen;
 
     std::string lib = abs_library_id;
     int limit = abs_page_size();
-    abs_async([gen, page, search, lib, limit] {
+    abs_async([gen, page, search, lib, limit, keep_visible] {
         std::vector<AbsItem> items;
         int total = -1;
         bool ok;
@@ -1380,12 +1811,17 @@ static void abs_load_page(int page, const std::string& search) {
         } else {
             ok = gAbs.getItems(lib, page, limit, search, items, total);
         }
-        abs_idle([gen, page, search, ok, items, total] {
+        abs_idle([gen, page, search, ok, items, total, keep_visible] {
             if (gen != abs_page_gen) return;
             if (!ok) {
-                lib_ready = false;
-                lib_show_message("Failed to reach the server.\nCheck Wi-Fi, the server address and your login.",
-                                 "Retry", on_lib_retry);
+                if (keep_visible && !abs_page_items.empty()) {
+                    lib_ready = true;
+                    lib_set_status("Refresh failed; showing previous results.");
+                } else {
+                    lib_ready = false;
+                    lib_show_message("Failed to reach the server.\nCheck Wi-Fi, the server address and your login.",
+                                     "Retry", on_lib_retry);
+                }
                 return;
             }
             // lib_fill_page clears the "Loading..." message itself
@@ -1448,11 +1884,26 @@ static void on_local_play(GtkWidget*, gpointer idx) {
     app_open_local_file(path.c_str());
 }
 
-static void on_lib_open_file(GtkWidget*, gpointer) { app_open_file_dialog(); }
+static void on_lib_action(GtkWidget*, gpointer) {
+    if (lib_local_mode) app_open_file_dialog();
+    else on_lib_downloads(NULL, NULL);
+}
+
+static void on_lib_local(GtkWidget*, gpointer) {
+    if (lib_local_mode) {
+        lib_local_mode = false;
+        abs_download_mode = false;
+        lib_update_toolbar();
+        if (lib_ready) abs_load_page(abs_page, abs_cur_search);
+        else lib_page_activate();
+    } else {
+        abs_download_mode = false;
+        lib_show_local();
+    }
+}
 
 static void lib_show_local() {
     lib_local_mode = true;
-    lib_ready = false;
     lib_update_toolbar();
     lib_local_books = db.getHistory();
 
@@ -1527,14 +1978,16 @@ GtkWidget* lib_page_new() {
     gtk_box_pack_start(GTK_BOX(bar), ui_hspace(14), FALSE, FALSE, 0);
     lib_status = ui_label_new("", 26, false, false, 0.0, 0, 77);
     gtk_box_pack_start(GTK_BOX(bar), lib_status, TRUE, TRUE, 0);
-    lib_search_btn = ui_button_new("Search", 26, 170, 60, 3, 8);
+    lib_search_btn = ui_button_new("Search", 26, 150, 60, 3, 8);
     ui_connect(lib_search_btn, on_lib_search, NULL);
     lib_view_btn = ui_button_new(abs_grid_view ? "List" : "Grid", 26, 130, 60, 3, 8);
     ui_connect(lib_view_btn, on_lib_view, NULL);
-    lib_open_btn = ui_button_new("Open file", 26, 200, 60, 3, 8);
-    ui_connect(lib_open_btn, on_lib_open_file, NULL);
-    GtkWidget* btns[3] = { lib_search_btn, lib_view_btn, lib_open_btn };
-    for (int i = 0; i < 3; i++) {
+    lib_local_btn = ui_button_new("Local", 26, 100, 60, 3, 8);
+    ui_connect(lib_local_btn, on_lib_local, NULL);
+    lib_open_btn = ui_button_new("Open file", 26, 135, 60, 3, 8);
+    ui_connect(lib_open_btn, on_lib_action, NULL);
+    GtkWidget* btns[4] = { lib_search_btn, lib_view_btn, lib_local_btn, lib_open_btn };
+    for (int i = 0; i < 4; i++) {
         GtkWidget* a = gtk_alignment_new(0.5, 0.5, 0, 0);
         gtk_container_add(GTK_CONTAINER(a), btns[i]);
         gtk_box_pack_start(GTK_BOX(bar), a, FALSE, FALSE, 0);
@@ -1552,6 +2005,13 @@ GtkWidget* lib_page_new() {
 }
 
 void lib_page_activate() {
+    // Local downloads remain available even when the network ABS library has
+    // been disabled or is not configured.
+    if (abs_download_mode) {
+        lib_local_mode = false;
+        lib_show_downloads();
+        return;
+    }
     if (!abs_settings_enabled()) {
         lib_show_local();
         return;
@@ -1561,7 +2021,6 @@ void lib_page_activate() {
         lib_ready = false;
     }
     lib_update_toolbar();
-
     AbsCfg c = abs_read_cfg();
     if (!abs_cfg_complete(c)) {
         lib_ready = false;
@@ -1579,7 +2038,7 @@ void lib_page_activate() {
     // (re)shown, instead of leaving a stale snapshot up - progress changed by
     // listening elsewhere in the app, or by another Audiobookshelf client,
     // should show up as soon as you come back to the Library.
-    abs_load_page(abs_page, abs_cur_search);
+    abs_load_page(abs_page, abs_cur_search, !abs_page_items.empty());
 }
 
 void abs_settings_changed() {

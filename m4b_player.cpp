@@ -1,6 +1,7 @@
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
 #include <glib.h>
+#include <gio/gio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,8 @@
 #include <execinfo.h>
 #include <signal.h>
 #include <ctime>
+#include <cctype>
+#include <algorithm>
 
 #include "music_backend.h"
 #include "database_manager.h"
@@ -61,6 +64,8 @@ static const int COVER_BOX_W = 440;
 static const int COVER_BOX_H = 440;
 
 static LIPC * lipcInstance = 0;
+static GDBusConnection* avrcp_bus = NULL;
+static gint64 avrcp_last_command_us = 0;
 
 // Debug helper: print a widget's allocation (LARK_DUMP_ALLOC=1) for tap testing
 static void dump_alloc(const char* name, GtkWidget* w) {
@@ -674,16 +679,60 @@ void jump_relative(int seconds) {
     last_timestamp = new_pos;
 
     backend.play_file(current_file.c_str(), new_pos);
+    update_local_info();
+    app_schedule_refresh(false);
 }
 
 static void on_rewind_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;(void)data;
-    jump_relative(-30);
+    jump_relative(-10);
 }
 
 static void on_ff_clicked(GtkWidget *widget, gpointer data) {
     (void)widget;(void)data;
-    jump_relative(30);
+    jump_relative(10);
+}
+
+static void on_avrcp_command(GDBusConnection*, const gchar*, const gchar*,
+                             const gchar*, const gchar*, GVariant* parameters,
+                             gpointer) {
+    // Kindle emits the Bluetooth media-key command on the system bus. Route
+    // it through the app's playback controls instead of synthesizing a screen
+    // tap at a firmware-specific coordinate.
+    gint64 now = g_get_monotonic_time();
+    if (now - avrcp_last_command_us < 500000) return;
+    avrcp_last_command_us = now;
+
+    gchar* printed = parameters ? g_variant_print(parameters, TRUE) : g_strdup("");
+    std::string command = printed ? printed : "";
+    g_free(printed);
+    std::transform(command.begin(), command.end(), command.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+
+    bool playing = backend.is_playing && !backend.is_paused;
+    if (command.find("pause") != std::string::npos) {
+        if (playing) on_play_pause_clicked(g_play_glyph, NULL);
+    } else if (command.find("play") != std::string::npos) {
+        if (!playing) on_play_pause_clicked(g_play_glyph, NULL);
+    } else {
+        // Firmware versions that omit the command argument only send this
+        // signal for the play/pause button.
+        on_play_pause_clicked(g_play_glyph, NULL);
+    }
+}
+
+static void start_avrcp_listener() {
+    GError* error = NULL;
+    avrcp_bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
+    if (!avrcp_bus) {
+        g_warning("Could not connect to the Bluetooth command bus: %s",
+                  error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        return;
+    }
+    g_dbus_connection_signal_subscribe(
+        avrcp_bus, NULL, "com.lab126.btfd", "BTavrcpCommand", NULL, NULL,
+        G_DBUS_SIGNAL_FLAGS_NONE, on_avrcp_command, NULL, NULL);
 }
 
 void on_destroy(GtkWidget *widget, gpointer data) {
@@ -1101,6 +1150,7 @@ int main(int argc, char *argv[]) {
         on_file_open(current_file.c_str());
     }
 
+    start_avrcp_listener();
     g_timeout_add(1000, update_ui, NULL);
     abs_debug_autostart();   // LARK_ABS_TEST=1: auto-open the library for testing
 

@@ -10,7 +10,10 @@ LARK Next is a free audiobook player for jailbroken Kindle devices. It continues
 - Play MP3 and AAC audio in M4B files
 - Browse Audiobookshelf libraries and book details
 - Sync playback sessions and listening progress with Audiobookshelf
+- Download Audiobookshelf books for offline listening
 - Use local audiobook files, history, chapters, and bookmarks
+- Browse recent local books while connected to Audiobookshelf
+- Control playback with Bluetooth play/pause and 10-second seek buttons
 - Configure display refresh, backlight, and sleep behavior
 
 ## Compatibility
