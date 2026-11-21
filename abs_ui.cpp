@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 
 #include "abs_client.h"
@@ -102,6 +103,17 @@ static std::string abs_download_track_path(const std::string& id, int index) {
     char path[320];
     snprintf(path, sizeof(path), "%s/%s_%d.mp3", ABS_CACHE_DIR, id.c_str(), index);
     return path;
+}
+
+static bool abs_download_space_budget(long long& max_bytes) {
+    struct statvfs space;
+    if (statvfs(ABS_CACHE_DIR, &space) != 0) return false;
+    unsigned long long available = (unsigned long long)space.f_bavail *
+                                  (unsigned long long)space.f_frsize;
+    const unsigned long long reserve = 16ULL * 1024ULL * 1024ULL;
+    if (available <= reserve) return false;
+    max_bytes = (long long)(available - reserve);
+    return true;
 }
 
 static bool abs_save_download_manifest(const AbsDownload& d) {
@@ -272,6 +284,20 @@ struct AbsPlayback {
     int next_fd_idx = -1;
 };
 static AbsPlayback ap;
+
+// ABS playback takes over the shared player controls. Save any local book's
+// current position first, then clear its identity so controls after an ABS
+// book finishes can't unexpectedly restart the previous local file.
+static void abs_leave_local_file() {
+    if (!current_file.empty() && !ap.active &&
+        (backend.is_playing || backend.is_paused)) {
+        int pos = (int)(backend.get_position() / GST_SECOND);
+        int dur = (int)(backend.get_duration() / GST_SECOND);
+        db.updateBookProgress(current_file, pos, dur, false);
+    }
+    current_file.clear();
+    last_timestamp = 0;
+}
 
 static void abs_store_offline_position(double position) {
     if (!ap.offline || ap.item_id.empty()) return;
@@ -1001,6 +1027,7 @@ static guint g_load_gen = 0;   // only the newest book selection may start
 
 static void abs_play_item(const std::string& item_id, const std::string& title,
                           const std::string& author) {
+    abs_leave_local_file();
     if (ap.active) abs_shutdown();   // finalize previous book (async)
     backend.stop();
     g_load_gen++;                    // cancel any in-flight book load
@@ -1084,6 +1111,7 @@ static void abs_play_item(const std::string& item_id, const std::string& title,
 }
 
 static void abs_play_downloaded(const AbsDownload& d) {
+    abs_leave_local_file();
     if (ap.active) abs_shutdown();
     backend.stop();
     ++g_load_gen;
@@ -1453,6 +1481,7 @@ static void on_lib_download(GtkWidget*, gpointer idx) {
         if (ok) ok = gAbs.startPlayback(item.id, session_id, d.tracks) &&
                      !session_id.empty() && !d.tracks.empty();
         if (ok) mkdir(ABS_CACHE_DIR, 0777);
+        std::vector<std::string> new_track_paths;
         for (size_t n = 0; ok && n < d.tracks.size(); ++n) {
             const size_t part_number = n + 1;
             const size_t part_total = d.tracks.size();
@@ -1469,17 +1498,26 @@ static void on_lib_download(GtkWidget*, gpointer idx) {
             if (stat(path.c_str(), &st) != 0 || st.st_size <= 0) {
                 std::string part = path + ".part";
                 remove(part.c_str());
+                long long max_bytes = 0;
+                if (!abs_download_space_budget(max_bytes)) { ok = false; break; }
                 int fd = open(part.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
                 long long bytes = 0;
-                ok = fd >= 0 && gAbs.downloadToFd(d.tracks[n].content_url, fd, -1, bytes);
+                ok = fd >= 0 && gAbs.downloadToFd(d.tracks[n].content_url, fd, max_bytes, bytes);
                 if (fd >= 0) close(fd);
                 ok = ok && bytes > 0 && rename(part.c_str(), path.c_str()) == 0;
-                if (!ok) remove(part.c_str());
+                if (ok) new_track_paths.push_back(path);
+                else remove(part.c_str());
             }
         }
         if (!session_id.empty() && !gAbs.closeSession(session_id))
             g_print("ABS: could not close download session %s\n", session_id.c_str());
         if (ok) ok = abs_save_download_manifest(d);
+        if (!ok) {
+            // Keep a failed or space-limited attempt from leaving unlisted
+            // audio files behind. Pre-existing playback caches are untouched.
+            for (size_t i = 0; i < new_track_paths.size(); ++i)
+                remove(new_track_paths[i].c_str());
+        }
         const std::string title = item.title;
         abs_idle([ok, title] {
             abs_download_busy = false;
