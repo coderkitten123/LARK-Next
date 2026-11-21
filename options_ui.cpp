@@ -197,7 +197,7 @@ GtkWidget* options_page_new() {
     // Exit
     GtkWidget* ex = ui_button_new("Exit", 28, 480, 66, 3, 0);
     ui_connect(ex, on_exit, NULL);
-    add_row(col, "Exit AudioBookPlayer", ex, 100);
+    add_row(col, "Exit LARK-Next", ex, 100);
     gtk_box_pack_start(GTK_BOX(col), ui_vspace(30), FALSE, FALSE, 0);
 
     GtkWidget* pad = gtk_alignment_new(0, 0, 1, 1);

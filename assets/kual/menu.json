@@ -1,7 +1,7 @@
 {
 	"items": [
 		{
-			"name": "LARK Audiobook Player",
+			"name": "LARK-Next",
 			"priority": 1,
 			"action": "/mnt/us/LARK/start_lark.sh"
 		}

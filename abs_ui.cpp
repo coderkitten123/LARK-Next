@@ -1943,7 +1943,14 @@ static void on_lib_local(GtkWidget*, gpointer) {
 static void lib_show_local() {
     lib_local_mode = true;
     lib_update_toolbar();
-    lib_local_books = db.getHistory();
+    std::vector<Book> history = db.getHistory();
+    lib_local_books.clear();
+    for (size_t i = 0; i < history.size(); ++i) {
+        struct stat st;
+        if (stat(history[i].filepath.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+            access(history[i].filepath.c_str(), R_OK) == 0)
+            lib_local_books.push_back(history[i]);
+    }
 
     if (lib_local_books.empty()) {
         lib_show_message("No books yet.\nTap \"Open file\" to pick an M4B or MP3 audiobook.",

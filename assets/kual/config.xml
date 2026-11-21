@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <extension>
 	<information>
-		<name>LARK</name>
-		<version>2.2</version>
+		<name>LARK-Next</name>
+		<version>2.9.2</version>
 		<author>kbarni</author>
 		<id>com.kbarni.lark</id>
 	</information>

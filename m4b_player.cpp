@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <pwd.h>
 #include <string>
 #include <fstream>
@@ -446,6 +447,43 @@ static void show_info_dialog(const char* msg) {
     gtk_widget_destroy(dialog);
 }
 
+static bool local_file_is_readable(const char* filepath) {
+    if (!filepath || !*filepath) return false;
+    struct stat st;
+    return stat(filepath, &st) == 0 && S_ISREG(st.st_mode) &&
+           access(filepath, R_OK) == 0;
+}
+
+static void save_current_local_progress() {
+    if (current_file.empty() || (!backend.is_playing && !backend.is_paused)) return;
+    int pos = (int)(backend.get_position() / GST_SECOND);
+    int dur = 0;
+    Book saved;
+    if (db.getBookProgress(current_file, saved)) dur = saved.duration;
+    // Querying the active pipeline for duration can block after the backing
+    // file has been removed. Keep the last known duration in that case.
+    if (local_file_is_readable(current_file.c_str()))
+        dur = (int)(backend.get_duration() / GST_SECOND);
+    db.updateBookProgress(current_file, pos, dur, false);
+}
+
+static void handle_missing_local_file() {
+    if (current_file.empty() || abs_is_active() ||
+        local_file_is_readable(current_file.c_str())) return;
+
+    save_current_local_progress();
+    backend.stop();
+    current_file.clear();
+    last_timestamp = 0;
+    db.setSetting("last_opened_file", "");
+    player_set_book("Local file unavailable", "");
+    player_set_cover(NULL);
+    player_set_info("The audiobook was deleted or moved.", "", "");
+    ui_glyph_set_icon(g_play_glyph, UI_ICON_PLAY);
+    app_schedule_refresh(false);
+    show_info_dialog("The local audiobook was deleted or moved.");
+}
+
 // ---------------------------------------------------------------------------------
 // Kindle Quick Settings / framework overlay recovery.
 // The stock Quick Settings drawer paints over our framebuffer without going
@@ -549,6 +587,7 @@ static void update_local_info() {
 
 gboolean update_ui(gpointer data) {
     (void)data;
+    handle_missing_local_file();
     abs_sync_tick();   // ABS: throttled server progress sync (no-op when inactive)
 
     bool playing = playing_now();
@@ -763,13 +802,17 @@ void app_exit() {
 void on_file_open(const char* filepath) {
     if (!filepath) return;
 
+    if (!local_file_is_readable(filepath)) {
+        if (current_file == filepath && !abs_is_active())
+            handle_missing_local_file();
+        else
+            show_info_dialog("This audiobook file is missing or cannot be read.");
+        return;
+    }
+
     if (abs_is_active()) abs_shutdown();   // opening a local file ends any ABS session
 
-    if (!current_file.empty() && (backend.is_playing || backend.is_paused)) {
-        gint64 pos = backend.get_position() / GST_SECOND;
-        gint64 dur = backend.get_duration() / GST_SECOND;
-        db.updateBookProgress(current_file, (int)pos, (int)dur, false);
-    }
+    save_current_local_progress();
 
     backend.stop();
 
@@ -969,7 +1012,7 @@ static GtkWidget* player_page_new() {
     // The heading and a filler at the bottom absorb whatever height the window
     // has beyond the fixed layout (the Kindle gives the app less than the full
     // screen), so nothing below is ever cut off.
-    GtkWidget* heading = ui_label_new("AudioBookPlayer", 80, true);
+    GtkWidget* heading = ui_label_new("LARK-Next", 80, true);
     GtkWidget* heading_slot = gtk_alignment_new(0.5, 0.5, 0, 0);
     gtk_container_add(GTK_CONTAINER(heading_slot), heading);
     gtk_widget_set_size_request(heading_slot, -1, ui_px(120));
